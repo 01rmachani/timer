@@ -4,31 +4,45 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Countdown Timer</title>
-  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
-  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@3/dist/tailwind.min.css" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen flex items-center justify-center">
   <div class="max-w-md w-full mx-auto py-12 px-6 text-center">
     <h1 class="text-3xl font-bold mb-2">Countdown Timer</h1>
     <p class="text-gray-400 mb-10">Set a duration and start counting down.</p>
 
-    <!-- Timer display (polls every second when running) -->
-    <div id="timer-display">
-      {% include "partials/timer_display.html" %}
+    <!-- Clock ring -->
+    <div id="clock-ring"
+         class="relative mx-auto flex items-center justify-center w-48 h-48 rounded-full border-4 border-gray-700 transition-colors duration-500">
+      <span id="display" class="font-mono text-5xl font-bold tracking-tight text-gray-300">01:00</span>
     </div>
 
-    <!-- Set duration form -->
-    <form hx-post="/timer/start" hx-target="#timer-display" hx-swap="innerHTML"
-          class="mt-8 flex items-center justify-center gap-3">
+    <!-- Status -->
+    <p id="status" class="mt-4 text-sm font-medium text-gray-500">Connecting…</p>
+
+    <!-- Pause / Reset -->
+    <div class="flex justify-center gap-3 mt-6">
+      <button id="btn-pause"
+              class="hidden bg-yellow-600 hover:bg-yellow-500 text-white px-5 py-2 rounded-lg text-sm font-medium transition-colors">
+        Pause
+      </button>
+      <button id="btn-reset"
+              class="bg-gray-700 hover:bg-gray-600 text-white px-5 py-2 rounded-lg text-sm font-medium transition-colors">
+        Reset
+      </button>
+    </div>
+
+    <!-- Set duration + Start -->
+    <form id="start-form" class="mt-8 flex items-center justify-center gap-3">
       <div class="flex flex-col items-center">
         <label class="text-xs text-gray-500 mb-1">Minutes</label>
-        <input type="number" name="minutes" min="0" max="99" value="1"
+        <input id="inp-minutes" type="number" min="0" max="99" value="1"
                class="w-20 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-center text-lg font-mono focus:outline-none focus:border-blue-500">
       </div>
       <span class="text-2xl font-bold text-gray-500 mt-4">:</span>
       <div class="flex flex-col items-center">
         <label class="text-xs text-gray-500 mb-1">Seconds</label>
-        <input type="number" name="seconds" min="0" max="59" value="0"
+        <input id="inp-seconds" type="number" min="0" max="59" value="0"
                class="w-20 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-center text-lg font-mono focus:outline-none focus:border-blue-500">
       </div>
       <button type="submit"
@@ -37,5 +51,115 @@
       </button>
     </form>
   </div>
+
+  <script>
+    const ring     = document.getElementById('clock-ring');
+    const display  = document.getElementById('display');
+    const status   = document.getElementById('status');
+    const btnPause = document.getElementById('btn-pause');
+    const btnReset = document.getElementById('btn-reset');
+
+    // Local countdown state
+    let endTime   = 0;
+    let isRunning = false;
+    let ticker    = null;
+
+    // ── Display helpers ──────────────────────────────────────────────────────
+    function fmt(secs) {
+      const m = Math.floor(secs / 60), s = secs % 60;
+      return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+    }
+
+    function applyState(remaining, running, done) {
+      display.textContent = fmt(remaining);
+
+      ring.className = 'relative mx-auto flex items-center justify-center w-48 h-48 rounded-full border-4 transition-colors duration-500 '
+        + (done ? 'border-green-500' : running ? 'border-blue-500' : 'border-gray-700');
+
+      display.className = 'font-mono text-5xl font-bold tracking-tight '
+        + (done ? 'text-green-400' : running ? 'text-white' : 'text-gray-300');
+
+      if (done) {
+        status.textContent = "Time's up!";
+        status.className = 'mt-4 text-sm font-medium text-green-400';
+      } else if (running) {
+        status.textContent = 'Running\u2026';
+        status.className = 'mt-4 text-sm font-medium text-blue-400 animate-pulse';
+      } else {
+        status.textContent = 'Ready';
+        status.className = 'mt-4 text-sm font-medium text-gray-500';
+      }
+
+      btnPause.classList.toggle('hidden', !running);
+      btnReset.classList.toggle('hidden',  running);
+    }
+
+    // Local tick — keeps display smooth without server round-trips
+    function startLocalTick(remaining) {
+      clearInterval(ticker);
+      endTime = Date.now() + remaining * 1000;
+      isRunning = true;
+      ticker = setInterval(() => {
+        const left = Math.max(0, Math.round((endTime - Date.now()) / 1000));
+        display.textContent = fmt(left);
+        // Server will push the authoritative "done" event when it fires
+      }, 250);
+    }
+
+    function stopLocalTick() {
+      clearInterval(ticker);
+      ticker = null;
+      isRunning = false;
+    }
+
+    // ── WebSocket ────────────────────────────────────────────────────────────
+    let ws;
+
+    function connect() {
+      ws = new WebSocket(`ws://${location.host}/ws`);
+
+      ws.onopen = () => {
+        status.textContent = 'Ready';
+        status.className = 'mt-4 text-sm font-medium text-gray-500';
+      };
+
+      // Server pushes on: connect, start, pause, reset, expiry
+      ws.onmessage = (e) => {
+        const { remaining, running, done } = JSON.parse(e.data);
+        if (running) {
+          startLocalTick(remaining);
+        } else {
+          stopLocalTick();
+        }
+        applyState(remaining, running, done);
+      };
+
+      ws.onclose = () => {
+        stopLocalTick();
+        status.textContent = 'Reconnecting…';
+        status.className = 'mt-4 text-sm font-medium text-yellow-400';
+        setTimeout(connect, 1500);
+      };
+    }
+
+    connect();
+
+    // ── Commands (sent over WebSocket, no HTTP) ──────────────────────────────
+    function send(msg) {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+    }
+
+    document.getElementById('start-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      send({
+        action: 'start',
+        minutes: parseInt(document.getElementById('inp-minutes').value) || 0,
+        seconds: parseInt(document.getElementById('inp-seconds').value) || 0,
+      });
+    });
+
+    btnPause.addEventListener('click', () => send({ action: 'pause' }));
+    btnReset.addEventListener('click', () => send({ action: 'reset' }));
+  </script>
 </body>
 </html>

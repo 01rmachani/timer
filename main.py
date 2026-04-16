@@ -1,131 +1,105 @@
-"""Countdown Timer — A simple countdown timer app"""
+"""Countdown Timer — event-driven WebSocket push (no polling)"""
 
-import os
-import sqlite3
+import asyncio
 import time
-from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
 
-DB_PATH = os.getenv("DB_PATH", "/tmp/timer.db")
-
-
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    db = get_db()
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS timer "
-        "(id INTEGER PRIMARY KEY, end_time REAL, duration INTEGER, running INTEGER DEFAULT 0)"
-    )
-    db.execute(
-        "INSERT OR IGNORE INTO timer (id, end_time, duration, running) VALUES (1, 0, 60, 0)"
-    )
-    db.commit()
-    db.close()
-    yield
-
-
-app = FastAPI(title="Countdown Timer", lifespan=lifespan)
+app = FastAPI(title="Countdown Timer")
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
+# ── Shared timer state ────────────────────────────────────────────────────────
+_state = {"end_time": 0.0, "duration": 60, "running": False}
+_clients: set[WebSocket] = set()
 
-def _get_timer(db):
-    return db.execute("SELECT * FROM timer WHERE id = 1").fetchone()
-
-
-def _remaining(row) -> int:
-    if not row["running"]:
-        return max(0, row["duration"])
-    remaining = row["end_time"] - time.time()
-    return max(0, int(remaining))
+# Background task handle – cancelled/restarted on each Start
+_expiry_task: asyncio.Task | None = None
 
 
+def _snapshot() -> dict:
+    if _state["running"]:
+        remaining = max(0, int(_state["end_time"] - time.time()))
+    else:
+        remaining = max(0, _state["duration"])
+    done = remaining == 0 and not _state["running"]
+    return {"remaining": remaining, "running": _state["running"], "done": done}
+
+
+async def _broadcast(data: dict):
+    dead = set()
+    for ws in _clients:
+        try:
+            await ws.send_json(data)
+        except Exception:
+            dead.add(ws)
+    _clients.difference_update(dead)
+
+
+async def _expiry_watcher(duration: float):
+    """Sleep until the timer expires, then push the final state once."""
+    await asyncio.sleep(duration)
+    if _state["running"]:
+        _state["running"] = False
+        await _broadcast({"remaining": 0, "running": False, "done": True})
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    db = get_db()
-    row = _get_timer(db)
-    db.close()
-    remaining = _remaining(row)
-    return templates.TemplateResponse(
-        "index.html",
-        {"request": request, "remaining": remaining, "running": bool(row["running"]), "duration": row["duration"]},
-    )
+    return templates.TemplateResponse("index.html", {"request": request})
 
 
-@app.get("/timer/state", response_class=HTMLResponse)
-async def timer_state(request: Request):
-    db = get_db()
-    row = _get_timer(db)
-    remaining = _remaining(row)
-    # Auto-stop when it reaches zero
-    if row["running"] and remaining == 0:
-        db.execute("UPDATE timer SET running = 0 WHERE id = 1")
-        db.commit()
-    db.close()
-    return templates.TemplateResponse(
-        "partials/timer_display.html",
-        {"request": request, "remaining": remaining, "running": bool(row["running"]) and remaining > 0},
-    )
+# ── WebSocket ─────────────────────────────────────────────────────────────────
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    global _expiry_task
+    await ws.accept()
+    _clients.add(ws)
 
+    # Send current state immediately on connect
+    await ws.send_json(_snapshot())
 
-@app.post("/timer/start", response_class=HTMLResponse)
-async def start_timer(request: Request):
-    form = await request.form()
-    minutes = int(form.get("minutes", 0))
-    seconds = int(form.get("seconds", 0))
-    duration = minutes * 60 + seconds
-    if duration <= 0:
-        duration = 60
-    db = get_db()
-    end_time = time.time() + duration
-    db.execute(
-        "UPDATE timer SET end_time = ?, duration = ?, running = 1 WHERE id = 1",
-        (end_time, duration),
-    )
-    db.commit()
-    row = _get_timer(db)
-    db.close()
-    remaining = _remaining(row)
-    return templates.TemplateResponse(
-        "partials/timer_display.html",
-        {"request": request, "remaining": remaining, "running": True},
-    )
+    try:
+        async for msg in ws.iter_json():
+            action = msg.get("action")
 
+            if action == "start":
+                minutes = int(msg.get("minutes", 0))
+                seconds = int(msg.get("seconds", 0))
+                duration = minutes * 60 + seconds or 60
 
-@app.post("/timer/pause", response_class=HTMLResponse)
-async def pause_timer(request: Request):
-    db = get_db()
-    row = _get_timer(db)
-    remaining = _remaining(row)
-    db.execute(
-        "UPDATE timer SET running = 0, duration = ? WHERE id = 1",
-        (remaining,),
-    )
-    db.commit()
-    db.close()
-    return templates.TemplateResponse(
-        "partials/timer_display.html",
-        {"request": request, "remaining": remaining, "running": False},
-    )
+                _state["duration"] = duration
+                _state["end_time"] = time.time() + duration
+                _state["running"] = True
 
+                # Cancel any previous expiry watcher, start a new one
+                if _expiry_task and not _expiry_task.done():
+                    _expiry_task.cancel()
+                _expiry_task = asyncio.create_task(_expiry_watcher(duration))
 
-@app.post("/timer/reset", response_class=HTMLResponse)
-async def reset_timer(request: Request):
-    db = get_db()
-    db.execute("UPDATE timer SET running = 0, duration = 60, end_time = 0 WHERE id = 1")
-    db.commit()
-    db.close()
-    return templates.TemplateResponse(
-        "partials/timer_display.html",
-        {"request": request, "remaining": 60, "running": False},
-    )
+                await _broadcast(_snapshot())
+
+            elif action == "pause":
+                remaining = max(0, int(_state["end_time"] - time.time()))
+                _state["duration"] = remaining
+                _state["running"] = False
+                if _expiry_task and not _expiry_task.done():
+                    _expiry_task.cancel()
+                await _broadcast(_snapshot())
+
+            elif action == "reset":
+                _state["duration"] = 60
+                _state["end_time"] = 0.0
+                _state["running"] = False
+                if _expiry_task and not _expiry_task.done():
+                    _expiry_task.cancel()
+                await _broadcast(_snapshot())
+
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        _clients.discard(ws)
